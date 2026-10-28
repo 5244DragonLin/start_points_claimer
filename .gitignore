@@ -1,0 +1,48 @@
+# 字节码 / 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 打包 / 安装
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 运行产物（含登录状态，绝不提交！）
+profile/
+logs/
+state.json
+config.yaml
+output/
+downloads/
+exports/
+
+# 日志
+*.log
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 自动化工具的记忆 / 本地元数据
+.workbuddy/
+
+# 临时文件
+*.tmp
+*.bak
+.cache/
