@@ -20,6 +20,7 @@ dist/
 profile/
 logs/
 state.json
+session_backup.json
 config.yaml
 output/
 downloads/

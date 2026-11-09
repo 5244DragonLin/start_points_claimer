@@ -11,6 +11,7 @@ start_points_claimer —— 腾讯 START 云游戏（start.qq.com）积分任务
     python main.py login        # 首次登录（弹窗扫码，登录状态保存到 profile/）
     python main.py run          # 日常运行：进入任务面板，自动领取可领奖励
     python main.py run --check  # 只检测有几项可领取，不点击
+    python main.py renew        # 登录态保活：轻量访问一次，刷新凭据并报告剩余有效期
     python main.py probe        # 调试：导出任务面板页面文字（页面改版排查用）
 
 日志固定输出四类关键信息：
@@ -24,6 +25,7 @@ start_points_claimer —— 腾讯 START 云游戏（start.qq.com）积分任务
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -68,11 +70,34 @@ CSS_SELECTORS = ("[class*='receive']", "[class*='claim']", "[class*='lingqu']")
 MAX_ROUNDS = 4             # 最多扫几轮（领取后面板可能刷新出新按钮）
 
 # 运行时
-PROFILE_DIR = "profile"    # 浏览器存档（登录状态），删掉需重新扫码
+# 浏览器存档（登录状态），删掉需重新扫码。
+# 建议放在不会被其他程序并发改写的本地目录；可用环境变量 START_PROFILE_DIR 指定位置，
+# 如 D:\start_data\profile
+PROFILE_DIR = os.environ.get("START_PROFILE_DIR") or "profile"
 LOGS_DIR = "logs"          # probe 调试输出目录（dom_dump.txt）
 STATE_FILE = "state.json"  # 当日去重记录
 LOG_FILE = ""              # 追加写入的日志文件，留空只打印
 LOGIN_WAIT_SECONDS = 300   # login 命令等待扫码的最长秒数
+BALANCE_WAIT_SECONDS = 10  # 轮询等待积分余额渲染的最长时间
+DETAIL_WAIT_SECONDS = 5    # 轮询等待明细弹窗渲染的最长时间
+
+# 登录态保活：把"还能用多久"的凭据单独备份一份。
+# 值 = 触发提醒的剩余天数（低于这个天数就在日志里提示重新 login）。
+SESSION_BACKUP = "session_backup.json"
+SESSION_WARN_DAYS = 7
+
+# 长期凭据：备份时整份存档，判定"还能用多久"则只看这几项。
+# 它们带 30 天~1 年有效期，且每次访问首页都会被腾讯滚动续期（start_uid 每次顺延 30 天），
+# 所以只要间隔不到 30 天跑一次 renew，登录态就不会自然过期。
+SESSION_COOKIE_NAMES = (
+    "RK",              # .qq.com      登录票据根（1 年）
+    "qlogin_uid",      # .qq.com      登录过的 QQ 号（1 年）
+    "pt2gguin",        # .ptlogin2    登录过的 QQ 号（1 年）
+    "ptcz",            # .qq.com      客户端指纹（1 年）
+    "pt_guid_sig",     # .ptlogin2    "记住我"签名（30 天滚动）
+    "pt_recent_uins",  # .ptlogin2    最近登录账号列表（30 天滚动）
+    "start_uid",       # .start.qq.com START 会话（30 天滚动）
+)
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +139,12 @@ def open_context(pw, headless: bool = HEADLESS):
         headless=headless,
         viewport={"width": VIEWPORT[0], "height": VIEWPORT[1]},
         locale="zh-CN",
-        args=["--disable-blink-features=AutomationControlled"],
+        # 磁盘缓存限到 20MB：本脚本只用一个页面，缓存大无收益，还能控制 profile 目录体积
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disk-cache-size=20971520",
+            "--media-cache-size=10485760",
+        ],
         ignore_default_args=["--enable-automation"],
     )
 
@@ -288,6 +318,9 @@ def read_points_info(context, open_detail: bool = True) -> dict:
     需要先点一下入口按钮。返回形如：
         {"balance": 552, "expire_amount": 120, "expire_date": "2026-12-31"}
     取不到的字段为 None，绝不抛异常影响主流程。
+
+    积分商城是 SPA 首屏渲染时快时慢，余额和弹窗都可能晚一拍才出现，
+    所以每一步都是轮询等待，不一次性判断。
     """
     info = {"balance": None, "expire_amount": None, "expire_date": None}
 
@@ -295,45 +328,62 @@ def read_points_info(context, open_detail: bool = True) -> dict:
     if frame is None:
         return info
 
-    # 1) 余额：商城页头的 .integral-num
-    try:
-        el = frame.locator(BALANCE_SEL).first
-        if el.is_visible():
-            info["balance"] = int(re.sub(r"\D", "", el.inner_text() or "") or 0)
-    except Exception:
-        pass
+    # 1) 余额：轮询商城页头的 .integral-num（首屏渲染慢时最多等 10 秒）
+    deadline = time.time() + BALANCE_WAIT_SECONDS
+    while time.time() < deadline:
+        try:
+            el = frame.locator(BALANCE_SEL).first
+            if el.is_visible():
+                text = (el.inner_text() or "").strip()
+                if text:
+                    info["balance"] = int(re.sub(r"\D", "", text) or 0)
+                    break
+        except Exception:
+            pass
+        time.sleep(1)
 
-    # 2) 过期信息：点开「积分明细」再读弹窗页头文字
+    # 2) 过期信息：点开「积分明细」弹窗，弹窗页头里既有余额也有过期提示
     if open_detail:
         try:
             btn = frame.get_by_text(POINTS_DETAIL_ENTRY, exact=True).first
             if btn.is_visible():
                 btn.click(timeout=5000)
-                frame.page.wait_for_timeout(2000)
+                frame.page.wait_for_timeout(1000)
         except Exception:
             pass
 
-    if info["expire_date"] is None:
+        # 弹窗渲染也许有滞后，轮询页头框，余额/过期轮都读出来再收工
+        deadline = time.time() + DETAIL_WAIT_SECONDS
+        while time.time() < deadline:
+            try:
+                box = frame.locator(DETAIL_BOX_SEL).first
+                if box.is_visible():
+                    text = box.inner_text() or ""
+                    if info["balance"] is None:
+                        m = BALANCE_RE.search(text)
+                        if m:
+                            info["balance"] = int(m.group(1))
+                    parsed = _parse_expire(text)
+                    if parsed:
+                        info["expire_amount"], info["expire_date"] = parsed
+                    if info["balance"] is not None and info["expire_date"]:
+                        break
+            except Exception:
+                pass
+            time.sleep(1)
+
+    # 兜底：整页文本里再搜余额与过期提示（含弹窗打开的可见文字）
+    if info["balance"] is None or info["expire_date"] is None:
         try:
-            box = frame.locator(DETAIL_BOX_SEL).first
-            if box.is_visible():
-                text = box.inner_text()
-                if info["balance"] is None:
-                    m = BALANCE_RE.search(text or "")
-                    if m:
-                        info["balance"] = int(m.group(1))
-                parsed = _parse_expire(text)
+            text = frame.evaluate(JS_TEXT)
+            if info["balance"] is None:
+                m = BALANCE_RE.search(text or "")
+                if m:
+                    info["balance"] = int(m.group(1))
+            if info["expire_date"] is None:
+                parsed = _parse_expire(text or "")
                 if parsed:
                     info["expire_amount"], info["expire_date"] = parsed
-        except Exception:
-            pass
-
-    # 兜底：弹窗打不开时，在整个 frame 文本里再搜一次过期提示
-    if info["expire_date"] is None:
-        try:
-            parsed = _parse_expire(frame.evaluate(JS_TEXT))
-            if parsed:
-                info["expire_amount"], info["expire_date"] = parsed
         except Exception:
             pass
 
@@ -437,6 +487,201 @@ def claim_all(context) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 登录态保活：备份 / 恢复 / 复查
+# ---------------------------------------------------------------------------
+
+# localStorage 读写：设备指纹与 start_token 都存在这里
+JS_LOCAL_STORAGE = """() => {
+  const out = {};
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    out[k] = localStorage.getItem(k);
+  }
+  return out;
+}"""
+JS_SET_LOCAL_STORAGE = """(data) => {
+  for (const k in data) {
+    try { localStorage.setItem(k, data[k]); } catch (e) {}
+  }
+}"""
+
+
+def _cookie_expiry(cookie) -> float:
+    """取 cookie 的过期时间戳；会话级 cookie 返回 0。"""
+    return cookie.get("expires") or 0
+
+
+def _fmt_expiry(expires: float) -> str:
+    if not expires or expires <= 0:
+        return "会话级"
+    return time.strftime("%Y-%m-%d", time.localtime(expires))
+
+
+def _days_left(expires: float) -> int:
+    """剩余天数；会话级 cookie 返回 -1（不参与判断）。"""
+    if not expires or expires <= 0:
+        return -1
+    return int((expires - time.time()) // 86400)
+
+
+def snapshot_session(context, page) -> dict:
+    """把"能免扫码重建登录"的东西整份抓下来：
+
+    1. cookie —— 全量（.qq.com 的登录票据 + .game.qq.com 的 AMS 会话 + .start.qq.com 的业务会话）
+    2. localStorage —— 设备指纹与 start_token
+
+    两者缺一不可：只还原 cookie 认不出这台机器，只还原 localStorage 又没有登录票据；
+    而且 .game.qq.com 那组 ams_* 凭据缺失时，任务面板会打开但读不到积分。
+    """
+    picked = []
+    for c in context.cookies():
+        picked.append({
+            "name": c["name"],
+            "value": c["value"],
+            "domain": c["domain"],
+            "path": c.get("path", "/"),
+            "expires": _cookie_expiry(c),
+            "secure": c.get("secure", False),
+            "httpOnly": c.get("httpOnly", False),
+            "sameSite": c.get("sameSite", "Lax"),
+        })
+
+    storage = {}
+    try:
+        storage = page.evaluate(JS_LOCAL_STORAGE) or {}
+    except Exception:
+        pass
+
+    return {"saved_at": int(time.time()), "cookies": picked, "local_storage": storage}
+
+
+def save_session_backup(context, page) -> dict:
+    """把凭据备份到 session_backup.json（权限 600，仅本人可读）。
+
+    cookie 部分只增不减：新抓到的若比备份里少（例如刚自愈、只发了 start_uid），
+    就以旧的为底做合并，避免把一份完整备份越写越小。
+    """
+    snap = snapshot_session(context, page)
+    if not snap["cookies"] and not snap["local_storage"]:
+        return snap
+
+    old = _load_session_backup()
+    merged = {(c["domain"], c["name"]): c for c in old.get("cookies", [])}
+    for c in snap["cookies"]:
+        merged[(c["domain"], c["name"])] = c
+    now = time.time()
+    snap["cookies"] = [
+        c for c in merged.values()
+        if not c.get("expires") or c["expires"] <= 0 or c["expires"] > now
+    ]
+    if not snap["local_storage"]:
+        snap["local_storage"] = old.get("local_storage", {})
+
+    path = _resolve(SESSION_BACKUP)
+    path.write_text(json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    return snap
+
+
+def _load_session_backup() -> dict:
+    path = _resolve(SESSION_BACKUP)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def restore_session_backup(context, page) -> int:
+    """把备份灌回浏览器（cookie + localStorage），返回恢复的凭据条数。
+
+    灌完必须再访问一次首页，让腾讯拿这些凭据去换发当次会话；
+    单靠 cookie 不够——设备指纹在 localStorage 里，两者齐了才认得出这台机器。
+    """
+    snap = _load_session_backup()
+    cookies = []
+    now = time.time()
+    for c in snap.get("cookies", []):
+        exp = c.get("expires") or -1
+        if exp > 0 and exp < now:
+            continue  # 已过期的别灌，免得帮倒忙
+        cookies.append({
+            "name": c["name"],
+            "value": c["value"],
+            "domain": c["domain"],
+            "path": c.get("path", "/"),
+            "expires": exp,
+            "secure": c.get("secure", False),
+            "httpOnly": c.get("httpOnly", False),
+            "sameSite": c.get("sameSite", "Lax"),
+        })
+    if not cookies:
+        return 0
+    context.add_cookies(cookies)
+
+    storage = snap.get("local_storage") or {}
+    if storage:
+        try:
+            page.evaluate(JS_SET_LOCAL_STORAGE, storage)
+        except Exception:
+            pass
+    return len(cookies)
+
+
+def session_report(context) -> dict:
+    """汇总当前登录态"还能撑多久"：返回 (剩余天数, 最早到期的凭据名, 过期时间)。"""
+    soonest_name, soonest_exp = None, 0.0
+    for c in context.cookies():
+        if c["name"] not in SESSION_COOKIE_NAMES:
+            continue
+        exp = _cookie_expiry(c)
+        if exp <= 0:
+            continue
+        if soonest_exp == 0 or exp < soonest_exp:
+            soonest_name, soonest_exp = c["name"], exp
+    if not soonest_name:
+        return {"days": -1, "name": None, "expires": 0}
+    return {"days": _days_left(soonest_exp), "name": soonest_name, "expires": soonest_exp}
+
+
+def log_session_report(report: dict) -> None:
+    """把"登录态还能用多久"打到日志，快到期时给出明确提醒。"""
+    if report["days"] < 0:
+        log.info("[保活] 未取到长期凭据的有效期。")
+        return
+    if report["days"] <= SESSION_WARN_DAYS:
+        log.info(
+            "[保活] 提醒：最早的凭据 %s 将于 %s 到期（还剩 %d 天），"
+            "建议尽快跑一次 python main.py login 续上。",
+            report["name"], _fmt_expiry(report["expires"]), report["days"],
+        )
+    else:
+        log.info(
+            "[保活] 登录态健康：最早的凭据 %s 到期于 %s，还剩 %d 天。",
+            report["name"], _fmt_expiry(report["expires"]), report["days"],
+        )
+
+
+def touch_session(context, page) -> bool:
+    """轻量"续期"：访问一次首页，让腾讯把 30 天期的凭据滚动顺延。
+
+    实测 start_uid / pt_guid_sig 每次访问都会重新计时，
+    所以只要间隔小于 30 天跑一次，登录态就不会自然过期。
+    """
+    try:
+        page.goto(HOME_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(4000)
+        return not find_login_button(context)
+    except Exception as exc:
+        log.info("[保活] 访问首页失败：%s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # 子命令
 # ---------------------------------------------------------------------------
 
@@ -464,9 +709,14 @@ def cmd_login(wait_secs: int) -> int:
                 break
             page.wait_for_timeout(2000)
 
+        snap = save_session_backup(ctx, page) if ok else {"cookies": []}
+        report = session_report(ctx)
         ctx.close()
     if ok:
         log.info("[登录] 成功：状态已保存到 %s，以后无需再扫码。", PROFILE_DIR)
+        log.info("[保活] 已备份 %d 条凭据到 %s，登录态丢失时可自动恢复。",
+                 len(snap["cookies"]), SESSION_BACKUP)
+        log_session_report(report)
         return 0
     log.info("[登录] 失败：超时未检测到登录，请重跑本命令再试一次。")
     return 1
@@ -506,9 +756,19 @@ def cmd_run(force: bool, keep_open: bool, visible: bool, check_only: bool) -> in
 
             # 登录状态是第一件要确认的事
             if find_login_button(ctx):
-                log.info("[登录] 失败：未检测到登录状态，请先运行 python main.py login")
-                return 2
-            log.info("[登录] 成功：登录状态有效")
+                # 掉登录了先别急着重扫码：用备份原地恢复一次
+                log.info("[登录] 未登录，尝试用 %s 里的凭据自动恢复……", SESSION_BACKUP)
+                n = restore_session_backup(ctx, page)
+                if n and touch_session(ctx, page):
+                    log.info("[登录] 成功：已用备份的 %d 条凭据免扫码恢复。", n)
+                else:
+                    log.info("[登录] 失败：备份凭据也无法恢复，请先运行 python main.py login")
+                    return 2
+            else:
+                log.info("[登录] 成功：登录状态有效")
+
+            # 顺手把凭据再续一次并刷新备份（每次访问都会滚动顺延 30 天）
+            save_session_backup(ctx, page)
 
             try_open_task_panel(ctx)
             page.wait_for_timeout(3000)
@@ -518,6 +778,7 @@ def cmd_run(force: bool, keep_open: bool, visible: bool, check_only: bool) -> in
 
             if check_only:
                 log_points_info(read_points_info(ctx))
+                log_session_report(session_report(ctx))
                 log.info("[结果] 登录正常；发现 %d 项可领取（--check 只检测不领取）。", len(found))
                 return 0
 
@@ -552,6 +813,36 @@ def cmd_run(force: bool, keep_open: bool, visible: bool, check_only: bool) -> in
 
 
 JS_TEXT = "() => (document.body.innerText || '').slice(0, 6000)"
+
+
+def cmd_renew(visible: bool) -> int:
+    """登录态保活：轻量访问一次首页，滚动续期凭据并报告剩余有效期。
+
+    比 run 轻得多（不点菜单、不领奖、不读积分），适合单独挂在更频繁的计划任务上，
+    例如每天跑 renew、月底跑 run，让 30 天期的凭据永远处在"刚续过"的状态。
+    """
+    with sync_playwright() as pw:
+        ctx = open_context(pw, headless=not visible)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        try:
+            ok = touch_session(ctx, page)
+            if not ok:
+                # 掉登录了：先用备份原地恢复，恢复不了才让人去扫码
+                log.info("[登录] 未登录，尝试用 %s 里的凭据自动恢复……", SESSION_BACKUP)
+                n = restore_session_backup(ctx, page)
+                if n and touch_session(ctx, page):
+                    log.info("[登录] 成功：已用备份的 %d 条凭据免扫码恢复。", n)
+                    ok = True
+                else:
+                    log.info("[登录] 失败：备份凭据也无法恢复，请运行 python main.py login 重新扫码。")
+                    return 2
+
+            snap = save_session_backup(ctx, page)
+            log.info("[结果] 登录态保活完成，凭据备份共 %d 条。", len(snap["cookies"]))
+            log_session_report(session_report(ctx))
+        finally:
+            ctx.close()
+    return 0
 
 
 def cmd_probe() -> int:
@@ -619,6 +910,9 @@ def main() -> int:
     p_run.add_argument("--force", action="store_true", help="忽略当天已运行记录")
     p_run.add_argument("--check", action="store_true", help="只检测有几项可领取，不点击（忽略当日去重）")
 
+    p_renew = sub.add_parser("renew", help="登录态保活：轻量访问一次，续期凭据并报告剩余有效期")
+    p_renew.add_argument("--visible", action="store_true", help="弹出浏览器窗口运行")
+
     sub.add_parser("probe", help="调试：导出任务面板页面文字")
 
     args = parser.parse_args()
@@ -626,6 +920,8 @@ def main() -> int:
 
     if args.cmd == "login":
         return cmd_login(args.wait)
+    if args.cmd == "renew":
+        return cmd_renew(args.visible)
     if args.cmd == "probe":
         return cmd_probe()
     return cmd_run(force=args.force, keep_open=args.keep_open,
