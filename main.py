@@ -8,17 +8,24 @@ start_points_claimer —— 腾讯 START 云游戏（start.qq.com）积分任务
 全程不伪造任何网络请求，行为与人工操作一致，不产生任何截图。
 
 用法：
-    python main.py login        # 首次登录（弹窗扫码，登录状态保存到 profile/）
+    python main.py login        # 首次登录（弹窗扫码）
     python main.py run          # 日常运行：进入任务面板，自动领取可领奖励
     python main.py run --check  # 只检测有几项可领取，不点击
-    python main.py renew        # 登录态保活：轻量访问一次，刷新凭据并报告剩余有效期
+    python main.py renew        # 登录态检查：轻量访问一次，失效时自动补登录
     python main.py probe        # 调试：导出任务面板页面文字（页面改版排查用）
 
 日志固定输出四类关键信息：
-    [登录] 成功/失败        —— 登录状态是否有效
+    [登录] 成功/失败        —— 登录状态是否有效（以服务端探活为准）
     [检测] 发现 N 项可领取  —— 面板里有几个"领取"按钮（含任务描述）
     [结果] 本次领取 X 项，剩余可领取 Y 项
     [积分] 总积分 N，最近过期 M 积分将于 YYYY-MM-DD 过期
+
+登录态说明：
+    腾讯 START 的登录态无法靠定时访问长期维持（实测 3~7 天即被服务端作废），
+    只有 start_uid 会随访问首页顺延，其余凭据不会自动续期。所以 run / renew
+    都带三级自救：现有存档 → session_backup.json → QQ 快捷登录自动重登。
+    前两级静默完成；第三级默认也在无头窗口里完成，不弹窗。
+    三级都失败才需要人工 python main.py login 扫码。
 
 更多说明见 README.md。
 """
@@ -34,7 +41,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -47,6 +54,24 @@ HOME_URL = "https://start.qq.com/webgame/home?ADTAG=10000000"
 # 浏览器
 HEADLESS = True            # 无头后台运行；run --visible 可临时弹窗
 VIEWPORT = (1440, 900)
+
+# QQ 快捷登录靠「https 页面 → localhost.ptlogin2.qq.com:4301」这条回环请求
+# 读本机 QQ 号，读到了头像才渲染出来。Chrome 138+ 默认开启本地网络访问检查
+# （Local Network Access），会以 "Permission was denied for this request to
+# access the `loopback` address space" 把这条请求挡掉，结果是登录框里永远
+# 只剩扫码、头像不渲染——无头和可见窗口都会中招。
+# 关掉这项检查即可恢复；它只管本地回环请求的权限判定，不影响页面其他行为。
+# 同时写上旧名 PrivateNetworkAccessChecks，兼容尚未改名的 Chromium 版本。
+LOCAL_NETWORK_FLAGS = [
+    "--disable-features=LocalNetworkAccessChecks,PrivateNetworkAccessChecks",
+]
+
+# 补登录（自动重登）默认用无头窗口完成，全程不闪窗。
+# 无头几轮都失败时是否回退可见窗口再试：默认关闭——实测卡住的地方是本机 QQ
+# 客户端的回环握手，跟窗口是否可见无关，弹窗基本救不回来，反而破坏"全程无感"。
+# 个别环境确实只有可见窗口能成，把它改成 True 即可恢复旧的兜底行为。
+REPAIR_HEADLESS = True
+REPAIR_VISIBLE_FALLBACK = False
 
 # 任务面板入口路径：头像下拉 → 我的资产 → 积分
 ENTRY_ASSETS = "我的资产"
@@ -86,17 +111,32 @@ DETAIL_WAIT_SECONDS = 5    # 轮询等待明细弹窗渲染的最长时间
 SESSION_BACKUP = "session_backup.json"
 SESSION_WARN_DAYS = 7
 
+# 服务端探活：页面每次加载都会 POST 这个接口，拿本地凭据换发当次会话。
+# 返回 22001（auth fail）说明凭据已被服务端作废（单点互斥、在别处重新登录、
+# 或存档被别的浏览器动过），这时首页可能"看起来"还登录着，但任务面板一定读不到数据。
+# 只观察页面自己发的那一次请求，不额外造请求。
+SESSION_PROBE_MARK = "/capi/login/v1/session"
+SESSION_PROBE_FAIL_CODE = 22001
+SESSION_PROBE_WAIT_SECONDS = 8
+
+# 只有这一项实测会随每次访问首页自动顺延（其余不会）。
+RENEWABLE_COOKIE_NAMES = ("start_uid",)
+# 业务凭据：到期不影响扫码态，但会让积分/资产接口读不到数据
+BIZ_COOKIE_PREFIXES = ("ams_",)
+
 # 长期凭据：备份时整份存档，判定"还能用多久"则只看这几项。
-# 它们带 30 天~1 年有效期，且每次访问首页都会被腾讯滚动续期（start_uid 每次顺延 30 天），
-# 所以只要间隔不到 30 天跑一次 renew，登录态就不会自然过期。
+# 注意：只有 start_uid 会被滚动顺延（见 RENEWABLE_COOKIE_NAMES）；
+# RK / pt_guid_sig / pt_recent_uins 等只在真正走一次登录握手时才刷新，
+# 光访问首页不会。所以这份报告只能说明"本地凭据最晚哪天到期"，
+# 不能保证登录态一定能用到那天。
 SESSION_COOKIE_NAMES = (
     "RK",              # .qq.com      登录票据根（1 年）
     "qlogin_uid",      # .qq.com      登录过的 QQ 号（1 年）
     "pt2gguin",        # .ptlogin2    登录过的 QQ 号（1 年）
     "ptcz",            # .qq.com      客户端指纹（1 年）
-    "pt_guid_sig",     # .ptlogin2    "记住我"签名（30 天滚动）
-    "pt_recent_uins",  # .ptlogin2    最近登录账号列表（30 天滚动）
-    "start_uid",       # .start.qq.com START 会话（30 天滚动）
+    "pt_guid_sig",     # .ptlogin2    "记住我"签名（30 天，不自动续）
+    "pt_recent_uins",  # .ptlogin2    最近登录账号列表（30 天，不自动续）
+    "start_uid",       # .start.qq.com START 会话（30 天滚动，唯一会自动顺延的）
 )
 
 
@@ -144,7 +184,7 @@ def open_context(pw, headless: bool = HEADLESS):
             "--disable-blink-features=AutomationControlled",
             "--disk-cache-size=20971520",
             "--media-cache-size=10485760",
-        ],
+        ] + LOCAL_NETWORK_FLAGS,
         ignore_default_args=["--enable-automation"],
     )
 
@@ -633,81 +673,354 @@ def restore_session_backup(context, page) -> int:
 
 
 def session_report(context) -> dict:
-    """汇总当前登录态"还能撑多久"：返回 (剩余天数, 最早到期的凭据名, 过期时间)。"""
-    soonest_name, soonest_exp = None, 0.0
-    for c in context.cookies():
-        if c["name"] not in SESSION_COOKIE_NAMES:
-            continue
-        exp = _cookie_expiry(c)
-        if exp <= 0:
-            continue
-        if soonest_exp == 0 or exp < soonest_exp:
-            soonest_name, soonest_exp = c["name"], exp
-    if not soonest_name:
-        return {"days": -1, "name": None, "expires": 0}
-    return {"days": _days_left(soonest_exp), "name": soonest_name, "expires": soonest_exp}
+    """汇总本地凭据的到期情况。
+
+    返回：
+        days / name / expires   —— 长期凭据里最早到期的那一条
+        biz_days / biz_name / biz_expires —— 业务凭据（ams_*）里最早到期的那一条
+
+    注意这只是"本地这份凭据最晚还能撑到哪天"，**不代表登录态一定能用到那天**：
+    实测只有 start_uid 会随访问首页顺延，其余凭据要真正走一次登录握手才刷新，
+    而服务端也可能随时把整份凭据作废（单点互斥）。
+    """
+    def _soonest(names=None, prefixes=()):
+        name, exp = None, 0.0
+        for c in context.cookies():
+            n = c["name"]
+            if names is not None and n not in names:
+                continue
+            if prefixes and not n.startswith(prefixes):
+                continue
+            e = _cookie_expiry(c)
+            if e <= 0:
+                continue
+            if exp == 0 or e < exp:
+                name, exp = n, e
+        return name, exp
+
+    name, exp = _soonest(names=SESSION_COOKIE_NAMES)
+    biz_name, biz_exp = _soonest(prefixes=BIZ_COOKIE_PREFIXES)
+
+    report = {
+        "days": _days_left(exp) if name else -1,
+        "name": name, "expires": exp,
+        "renewable": name in RENEWABLE_COOKIE_NAMES,
+        "biz_days": _days_left(biz_exp) if biz_name else None,
+        "biz_name": biz_name, "biz_expires": biz_exp,
+    }
+    return report
 
 
-def log_session_report(report: dict) -> None:
-    """把"登录态还能用多久"打到日志，快到期时给出明确提醒。"""
+def log_session_report(report: dict, alive=None) -> None:
+    """播报本地凭据到期情况。
+
+    alive：服务端探活的结论（True 还认 / False 已作废 / None 未知）。
+    这里只说"本地凭据哪天到期"，不再宣称"登录态健康"——那句话会误导人。
+    """
+    if alive is False:
+        log.info("[保活] 登录态已失效：本地凭据被服务端作废，只能重新扫码。")
+        return
+
     if report["days"] < 0:
         log.info("[保活] 未取到长期凭据的有效期。")
-        return
-    if report["days"] <= SESSION_WARN_DAYS:
+    elif report["days"] <= SESSION_WARN_DAYS:
         log.info(
-            "[保活] 提醒：最早的凭据 %s 将于 %s 到期（还剩 %d 天），"
-            "建议尽快跑一次 python main.py login 续上。",
+            "[保活] 提醒：本地凭据 %s 将于 %s 到期（还剩 %d 天），"
+            "到期前请跑一次 python main.py login 续上。",
             report["name"], _fmt_expiry(report["expires"]), report["days"],
         )
     else:
+        renew_note = "会随访问首页顺延" if report.get("renewable") else "不会自动续期"
         log.info(
-            "[保活] 登录态健康：最早的凭据 %s 到期于 %s，还剩 %d 天。",
-            report["name"], _fmt_expiry(report["expires"]), report["days"],
+            "[保活] 本地凭据里最先到期的是 %s（%s，还剩 %d 天，%s）；"
+            "登录态能否活到那天取决于服务端，不取决于这个日期。",
+            report["name"], _fmt_expiry(report["expires"]), report["days"], renew_note,
         )
 
+    # 业务凭据通常比登录凭据先到期，到期后任务面板读不到积分，但页面仍显示已登录
+    if report.get("biz_days") is not None:
+        if report["biz_days"] <= SESSION_WARN_DAYS:
+            log.info(
+                "[保活] 提醒：业务凭据 %s 将于 %s 到期（还剩 %d 天），"
+                "它一到期任务面板就读不到积分，需重新 login。",
+                report["biz_name"], _fmt_expiry(report["biz_expires"]), report["biz_days"],
+            )
+        else:
+            log.info(
+                "[保活] 业务凭据 %s 到期于 %s（还剩 %d 天）。",
+                report["biz_name"], _fmt_expiry(report["biz_expires"]), report["biz_days"],
+            )
 
-def touch_session(context, page) -> bool:
-    """轻量"续期"：访问一次首页，让腾讯把 30 天期的凭据滚动顺延。
 
-    实测 start_uid / pt_guid_sig 每次访问都会重新计时，
-    所以只要间隔小于 30 天跑一次，登录态就不会自然过期。
+def watch_session_probe(page) -> dict:
+    """旁听页面自己发出的登录态探活请求，不额外造请求。
+
+    页面每次加载首页都会 POST {my.start.qq.com}/capi/login/v1/session，
+    用本地凭据换发当次会话：code=0 说明服务端还认这份凭据，
+    code=22001（auth fail）说明已被作废——此时页面可能仍显示已登录，
+    但任务面板注定读不到数据。返回一个可变 dict，供后续读取结论。
     """
+    state = {"code": None, "url": ""}
+
+    def on_response(resp):
+        try:
+            if SESSION_PROBE_MARK not in resp.url:
+                return
+            state["url"] = resp.url
+            body = resp.json() or {}
+            state["code"] = body.get("code")
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+    return state
+
+
+def probe_verdict(state: dict):
+    """把探活结果翻译成 True/False/None（未知）。"""
+    if not state or state.get("code") is None:
+        return None
+    return state["code"] == 0
+
+
+def touch_session(context, page, probe=None) -> bool:
+    """访问一次首页：让可滚动的凭据顺延，并判断服务端是否还认这份登录态。
+
+    实测只有 start_uid 会随访问首页顺延（30 天滚动）；pt_guid_sig、
+    pt_recent_uins 等要在真正走一次登录握手时才刷新。所以本函数
+    **不是**"无限续期"，只是"顺手把 start_uid 往后推"。
+
+    判定以服务端探活为准（probe_verdict），页面上的"登录"按钮只作兜底。
+    """
+    if probe is not None:
+        probe.update({"code": None, "url": ""})
     try:
         page.goto(HOME_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(4000)
-        return not find_login_button(context)
+        deadline = time.time() + SESSION_PROBE_WAIT_SECONDS
+        while probe is not None and time.time() < deadline:
+            if probe.get("code") is not None:
+                break
+            page.wait_for_timeout(500)
+        page.wait_for_timeout(2000)
     except Exception as exc:
         log.info("[保活] 访问首页失败：%s", exc)
         return False
+
+    verdict = probe_verdict(probe)
+    if verdict is True:
+        return True
+    if verdict is False:
+        code = probe.get("code")
+        hint = "（auth fail，凭据已被服务端作废）" if code == SESSION_PROBE_FAIL_CODE else ""
+        log.info("[登录] 服务端探活失败：code=%s%s", code, hint)
+        return False
+    return not find_login_button(context)
 
 
 # ---------------------------------------------------------------------------
 # 子命令
 # ---------------------------------------------------------------------------
 
+# QQ 快捷登录：电脑 QQ 客户端已登录时，登录框默认就有"快捷登录"面板，
+# 点一下头像就能登录，无需扫码。头像本体是带 uin 属性的链接（实测于 xui.ptlogin2 登录框）。
+# 只保留精确选择器：泛化的 .face 会命中登录框里的其他头像元素，误点会把整个
+# 登录弹窗关掉，反而更慢，所以不用。
+QUICK_LOGIN_SELECTORS = (
+    "a[uin]",              # 头像链接（uin=QQ号，最可靠）
+    "#qlogin_list .face",  # 快捷登录列表里的头像
+)
+QUICK_LOGIN_WAIT_SECONDS = 30  # 等本机 QQ 客户端握手、快捷登录面板出现的最长时间
+# 登录框出现后，正常 4~5 秒就该渲染出快捷登录头像；超过这个时间还没有，
+# 基本是本机 QQ 的回环握手这一轮失败了（日志里是"尝试完所有端口都失败了"），
+# 与其干等，不如早点回去重新握手
+QUICK_LOGIN_GIVEUP_AFTER = 15
+# 本地端口握手偶尔整体失败，重新加载一次首页通常就能重新握手成功，所以给两次机会。
+# （能否拿到头像取决于本机 QQ 每次握手成没成，属抽签性质，重载比关掉重开更有效）
+QUICK_LOGIN_ROUNDS = 3
+# 点"登录"到 ptlogin2 登录框真正加载出来实测要 10~15 秒（要先经过
+# graph.qq.com/oauth2.0/authorize 跳一次），等得短了会误判成失败
+LOGIN_DIALOG_WAIT_SECONDS = 20
+LOGIN_CLICK_RETRIES = 3
+LOGIN_ENTRY_SELECTOR = ".user-info"
+LOGIN_ENTRY_WAIT_SECONDS = 8  # 首页刚打开时顶栏头像区还没渲染，点之前先等它出现
+
+# 登录框是往首页里插 iframe。frame URL 要等加载完才有值，而加载期间
+# 页面已经被遮罩盖住（此时再点"登录"必定超时）。所以判定"登录框是否已开出"
+# 不能只看 frame URL，还要看 DOM 里有没有对应的 iframe 元素。
+JS_LOGIN_IFRAME = """() => Array.from(document.querySelectorAll('iframe')).some(f => {
+  const s = f.getAttribute('src') || '';
+  return s.indexOf('ptlogin2') >= 0 || s.indexOf('graph.qq.com/oauth2.0') >= 0;
+})"""
+# 头像点完后 OAuth 授权页可能停在确认页，只做精确匹配点击（避免误点
+# "授权即同意服务协议"这类静态文字），且仅在快捷登录流程中使用
+AUTHORIZE_LABELS = ("授权并登录", "授权并进入")
+
+
+def wait_login_entry(context, page, timeout: float = LOGIN_ENTRY_WAIT_SECONDS) -> bool:
+    """等顶栏的登录/头像区（.user-info）渲染出来。
+
+    首页是 SPA，顶栏异步挂载；无头下虽然快，但偶尔还是没等它出来就点，
+    点击会直接超时。先等元素出现再点，能明显减少"点登录没反应"的假失败。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if page.locator(LOGIN_ENTRY_SELECTOR).first.is_visible():
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+    return False
+
+
+def open_login_dialog(context, page) -> bool:
+    """点右上角"登录"，把 QQ 登录框拉起来；拉不起来才重试。
+
+    登录框要走一段 graph.qq.com/oauth2.0/authorize 跳转，再插入 ptlogin2
+    iframe，实测 10~15 秒才真正可用。两个坑：
+    1. 只等 frame URL 会误判——iframe 加载期间 URL 还是空的，但页面已被遮罩
+       盖住，此时"重试点击"必定超时，于是把已经打开的登录框当成没打开。
+    2. 因此这里先额外判定 DOM 里是否已插入登录 iframe；一旦插入就只等它加载完，
+       不再重复点击。
+    """
+    def iframe_inserted() -> bool:
+        try:
+            return bool(page.evaluate(JS_LOGIN_IFRAME))
+        except Exception:
+            return False
+
+    def dialog_ready() -> bool:
+        for pg, frame in list(iter_frames(context)):
+            u = frame.url or ""
+            if "ptlogin2" in u or "graph.qq.com/oauth2.0" in u:
+                return True
+        return False
+
+    deadline = time.time() + LOGIN_DIALOG_WAIT_SECONDS
+    for attempt in range(1, LOGIN_CLICK_RETRIES + 1):
+        if not iframe_inserted():
+            try:
+                # 点登录会拉起跨域 iframe，用 no_wait_after 免得干等加载完成
+                page.locator(LOGIN_ENTRY_SELECTOR).first.click(
+                    timeout=5000, no_wait_after=True)
+            except Exception as exc:
+                # 点击超时也可能只是被遮罩挡着，说明登录框已经开了，继续等它加载
+                if iframe_inserted():
+                    break
+                log.info("第 %d 次点登录未成功(%s)，请在页面上手动点右上角'登录'。", attempt, exc)
+                return False
+
+        while time.time() < deadline:
+            if dialog_ready():
+                if attempt > 1:
+                    log.info("第 %d 次点登录成功，登录框已弹出。", attempt)
+                else:
+                    log.info("已自动点击登录按钮，登录框已弹出。")
+                return True
+            page.wait_for_timeout(500)
+        if attempt < LOGIN_CLICK_RETRIES:
+            log.info("第 %d 次点登录后没等到登录框，重试……", attempt)
+            deadline = time.time() + LOGIN_DIALOG_WAIT_SECONDS
+    log.info("多次点击都没拉起登录框，请手动点右上角'登录'。")
+    return False
+
+
+def try_quick_login(context) -> bool:
+    """检测登录框里的 QQ 快捷登录并点头像，点到了返回 True，没有返回 False。
+
+    点登录后登录框先显示密码页签，等本机 QQ 客户端握手完成（约 4 秒），
+    面板自动切成"快捷登录"并显示出头像（带 uin 属性的链接），届时点击。
+
+    点头像会触发跨域跳转，点击动作本身经常以"frame 已销毁"报错收场——
+    这恰恰说明点生效了，所以这里对异常宽容：只要点出去了就算成功，
+    真正的登录结果由调用方按登录态判断。
+    """
+    deadline = time.time() + QUICK_LOGIN_WAIT_SECONDS
+    # 只在"登录框已加载完、但头像迟迟不来"时才提前放弃；
+    # 登录框本身要 10~15 秒才加载出来，这段时间不能算进放弃计时
+    giveup_at = None
+    while time.time() < deadline:
+        for pg, frame in list(iter_frames(context)):
+            if "ptlogin2" not in (frame.url or ""):
+                continue
+            if giveup_at is None:
+                giveup_at = time.time() + QUICK_LOGIN_GIVEUP_AFTER
+            for selector in QUICK_LOGIN_SELECTORS:
+                try:
+                    el = frame.locator(selector).first
+                    if not el.is_visible():
+                        continue
+                except Exception:
+                    continue
+                # 依次尝试：普通点击 → 强制点击 → 直接派发事件（动画遮挡时的兜底）
+                for attempt in ("click", "force", "event"):
+                    try:
+                        if attempt == "click":
+                            el.click(timeout=3000, no_wait_after=True)
+                        elif attempt == "force":
+                            el.click(timeout=3000, force=True, no_wait_after=True)
+                        else:
+                            el.dispatch_event("click")
+                        log.info("检测到 QQ 快捷登录，已点击头像自动登录。")
+                        return True
+                    except Exception as exc:
+                        # 跨域跳转把 frame 干掉了：点击其实已经生效
+                        if any(k in str(exc) for k in ("detached", "navigat", "Target closed")):
+                            log.info("检测到 QQ 快捷登录，已点击头像自动登录。")
+                            return True
+                        continue
+        # 登录框已加载但头像迟迟不来：这一轮本地握手多半失败了，早点回去重握手
+        if giveup_at and time.time() > giveup_at:
+            log.info("登录框里没出现快捷登录头像（本机 QQ 握手未成功），稍后重试。")
+            return False
+        time.sleep(1)
+    return False
+
+
 def cmd_login(wait_secs: int) -> int:
-    """首次登录：弹出可见浏览器窗口，自动点登录框，轮询等待人工扫码。"""
+    """首次登录：弹出可见浏览器窗口，自动点登录框。
+
+    电脑上 QQ 客户端已登录时优先走"QQ 快速登录"（点头像即进，无需人工介入）；
+    没有快速登录才轮询等待人工扫码。
+    """
     with sync_playwright() as pw:
-        ctx = open_context(pw, headless=False)  # 扫码必须有可见窗口
+        ctx = open_context(pw, headless=False)  # 快速登录/扫码都要可见窗口
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(HOME_URL, wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
+        wait_login_entry(ctx, page)
 
+        quick_login = False
         if find_login_button(ctx):
-            try:
-                page.locator(".user-info", has_text="登录").first.click(timeout=5000)
-                log.info("已自动点击登录按钮，弹出二维码后请用手机 QQ/微信扫码。")
-            except Exception as exc:
-                log.info("自动点登录失败(%s)，请在页面上手动点右上角'登录'。", exc)
+            # 登录框拉起来之后再判断有没有快捷登录
+            if open_login_dialog(ctx, page) and try_quick_login(ctx):
+                quick_login = True
+            else:
+                log.info("没有可用的 QQ 快捷登录，等待扫码中，最长等 %d 秒……", wait_secs)
 
-        log.info("等待扫码中，最长等 %d 秒……扫码成功后脚本会自动确认并关闭浏览器。", wait_secs)
-        deadline = time.time() + wait_secs
+        deadline = time.time() + (wait_secs if not quick_login else 60)
         ok = False
         while time.time() < deadline:
             if not find_login_button(ctx):
                 ok = True
                 break
+            # 快捷登录点头像后可能停在 OAuth 授权确认页，精确匹配点掉
+            if quick_login:
+                _click_first(ctx, AUTHORIZE_LABELS, extra_sel="#approve")
             page.wait_for_timeout(2000)
+
+        alive = None
+        if ok:
+            # 回首页做一次服务端探活：页面显示已登录不等于凭据真能被服务端认下
+            probe = watch_session_probe(page)
+            alive = touch_session(ctx, page, probe)
+            if not alive:
+                log.info("[登录] 页面上看似已登录，但服务端探活未通过，凭据可能未生效。")
+
+        if ok and quick_login:
+            log.info("[登录] QQ 快捷登录成功，无需扫码。")
+        elif not ok:
+            log.info("超时未检测到登录。")
 
         snap = save_session_backup(ctx, page) if ok else {"cookies": []}
         report = session_report(ctx)
@@ -716,7 +1029,7 @@ def cmd_login(wait_secs: int) -> int:
         log.info("[登录] 成功：状态已保存到 %s，以后无需再扫码。", PROFILE_DIR)
         log.info("[保活] 已备份 %d 条凭据到 %s，登录态丢失时可自动恢复。",
                  len(snap["cookies"]), SESSION_BACKUP)
-        log_session_report(report)
+        log_session_report(report, alive=alive)
         return 0
     log.info("[登录] 失败：超时未检测到登录，请重跑本命令再试一次。")
     return 1
@@ -738,6 +1051,156 @@ def _save_state(state: dict) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _quick_login_once(pw, headless: bool, wait_secs: int) -> bool:
+    """开一个窗口，在里面反复尝试 QQ 快捷登录，成功把凭据存进 profile 并返回 True。
+
+    重试放在**同一个窗口内重载首页**，而不是关掉重开：
+    QQ 快捷登录能不能成，取决于本机 QQ 客户端那次回环握手成功没有
+    （日志里"尝试完所有端口都失败了"就是没成功），而这件事每次页面加载
+    都是重新抽一次签。重载比关掉重开快得多，实测命中率也更高。
+    """
+    ctx = open_context(pw, headless=headless)
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    try:
+        for round_no in range(1, QUICK_LOGIN_ROUNDS + 1):
+            log.info("[续期] 打开%s窗口，尝试用 QQ 快捷登录自动恢复（第 %d 轮，无需你操作）……",
+                     "无头" if headless else "可见", round_no)
+            if _quick_login_round(ctx, page, wait_secs):
+                return True
+            if round_no < QUICK_LOGIN_ROUNDS:
+                log.info("[续期] 本轮未成功，重新加载页面再试……")
+                page.wait_for_timeout(2000)
+        return False
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+
+def _quick_login_round(ctx, page, wait_secs: int) -> bool:
+    """一轮完整尝试：加载首页 → 拉登录框 → 点头像 → 等登录完成 → 服务端确认。"""
+    page.goto(HOME_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(3000)
+
+    if not find_login_button(ctx):
+        # 顶栏还没渲染完时 find_login_button 也会返回 False，先等一会儿再判一次，
+        # 免得把"页面还没加载好"误判成"已经是登录状态"
+        wait_login_entry(ctx, page)
+        if not find_login_button(ctx):
+            log.info("[续期] 页面打开后已经是登录状态，无需操作。")
+            save_session_backup(ctx, page)
+            return True
+
+    if not open_login_dialog(ctx, page):
+        return False
+    if not try_quick_login(ctx):
+        return False
+
+    # 点头像后可能停在 OAuth 授权确认页，精确匹配点掉并等登录完成
+    deadline = time.time() + wait_secs
+    ok = False
+    while time.time() < deadline:
+        if not find_login_button(ctx):
+            ok = True
+            break
+        _click_first(ctx, AUTHORIZE_LABELS, extra_sel="#approve")
+        page.wait_for_timeout(2000)
+    if not ok:
+        log.info("[续期] 等待登录完成超时。")
+        return False
+
+    # 回首页做服务端确认，通过才存备份（避免把坏凭据覆盖上去）
+    probe = watch_session_probe(page)
+    if not touch_session(ctx, page, probe):
+        log.info("[续期] 页面显示已登录，但服务端探活未通过。")
+        return False
+
+    save_session_backup(ctx, page)
+    log.info("[续期] QQ 快捷登录成功，登录态已恢复并保存。")
+    return True
+
+
+def quick_login_into_profile(pw, wait_secs: int = QUICK_LOGIN_WAIT_SECONDS + 30,
+                             headless: bool = REPAIR_HEADLESS) -> bool:
+    """走 QQ 快捷登录把凭据写回 profile，返回是否成功。
+
+    默认在**无头窗口**里完成，全程不弹窗：
+    1. 无头能成，就完全不弹窗——这是默认路径。
+       （历史上无头拿不到头像，根因是 Chrome 138+ 的本地网络访问检查挡住了
+        localhost.ptlogin2 回环请求，已在 open_context 里关掉，见
+        LOCAL_NETWORK_FLAGS；关掉后无头同样能渲染快捷登录头像。）
+    2. 同一个窗口里最多重载试 QUICK_LOGIN_ROUNDS 轮——能否拿到头像取决于
+       本机 QQ 客户端每次握手成没成，属抽签性质，重载比关掉重开更管用。
+    3. REPAIR_VISIBLE_FALLBACK 打开时，无头全败后才回退可见窗口兜底；
+       默认关闭，因为实测失败原因是本机 QQ 侧握手，弹窗救不回来。
+    4. 同一个 profile 目录不能被两个浏览器同时占用，调用前必须先关掉原 context。
+    """
+    if not headless:
+        return _quick_login_once(pw, False, wait_secs)
+
+    if _quick_login_once(pw, True, wait_secs):
+        return True
+    if not REPAIR_VISIBLE_FALLBACK:
+        log.info("[续期] 登录框里没有可用的 QQ 快捷登录，自动恢复失败。")
+        return False
+    log.info("[续期] 无头模式没能完成快捷登录，回退可见窗口再试一次……")
+    if _quick_login_once(pw, False, wait_secs):
+        return True
+    log.info("[续期] 登录框里没有可用的 QQ 快捷登录，自动恢复失败。")
+    return False
+
+
+def acquire_logged_in_context(pw, visible: bool, allow_repair: bool = True):
+    """打开浏览器并保证登录可用，返回 (context, page, alive)。
+
+    三级阶梯，越往后越慢：
+        1. 存档里现有凭据还认 → 直接用（绝大多数情况，一次都不用重登）
+        2. 不认 → 灌回 session_backup.json 再试（profile 被清空的场景）
+        3. 还不认 → 关掉当前实例，走 QQ 快捷登录（服务端作废的场景）
+
+    第 3 步默认在无头窗口里完成，全程不弹窗；只有无头拿不到快捷登录头像
+    （极少数环境）才回退可见窗口闪一下。allow_repair=False 时跳过第 3 步，
+    交给调用方决定（`login` 命令自己就走可见窗口）。
+    """
+    ctx = open_context(pw, headless=not visible)
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+    probe = watch_session_probe(page)
+    if touch_session(ctx, page, probe):
+        log.info("[登录] 成功：登录状态有效")
+        return ctx, page, True
+
+    # 第 2 级：本地恢复
+    log.info("[登录] 未登录，尝试用 %s 里的凭据自动恢复……", SESSION_BACKUP)
+    n = restore_session_backup(ctx, page)
+    if n and touch_session(ctx, page, probe):
+        log.info("[登录] 成功：已用备份的 %d 条凭据免扫码恢复。", n)
+        return ctx, page, True
+
+    if not allow_repair:
+        return ctx, page, False
+
+    # 第 3 级：自动补登录（必须独占 profile，先关掉当前实例）
+    log.info("[登录] 本地凭据已失效，尝试自动重新登录……")
+    try:
+        ctx.close()
+    except Exception:
+        pass
+    # 补登录与 run 的可见性无关：默认走无头，避免计划任务里闪窗
+    if not quick_login_into_profile(pw, headless=True):
+        return None, None, False
+
+    # 重新用正常模式（可能是无头）打开，确认恢复成功
+    ctx = open_context(pw, headless=not visible)
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    probe = watch_session_probe(page)
+    if touch_session(ctx, page, probe):
+        log.info("[登录] 成功：已用 QQ 快捷登录自动恢复，本次无需人工扫码。")
+        return ctx, page, True
+    return ctx, page, False
+
+
 def cmd_run(force: bool, keep_open: bool, visible: bool, check_only: bool) -> int:
     # --check 模式忽略当日去重（随时可查），也不写 state.json
     if not check_only:
@@ -748,26 +1211,17 @@ def cmd_run(force: bool, keep_open: bool, visible: bool, check_only: bool) -> in
             return 0
 
     with sync_playwright() as pw:
-        ctx = open_context(pw, headless=not visible)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        ctx, page, alive = acquire_logged_in_context(pw, visible=visible)
+        if not alive:
+            if ctx is not None:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+            log.info("[登录] 失败：本地凭据与 QQ 快捷登录都没能恢复，请运行 python main.py login 手动扫码")
+            return 2
         try:
-            page.goto(HOME_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(4000)  # 等页面 JS 渲染
-
-            # 登录状态是第一件要确认的事
-            if find_login_button(ctx):
-                # 掉登录了先别急着重扫码：用备份原地恢复一次
-                log.info("[登录] 未登录，尝试用 %s 里的凭据自动恢复……", SESSION_BACKUP)
-                n = restore_session_backup(ctx, page)
-                if n and touch_session(ctx, page):
-                    log.info("[登录] 成功：已用备份的 %d 条凭据免扫码恢复。", n)
-                else:
-                    log.info("[登录] 失败：备份凭据也无法恢复，请先运行 python main.py login")
-                    return 2
-            else:
-                log.info("[登录] 成功：登录状态有效")
-
-            # 顺手把凭据再续一次并刷新备份（每次访问都会滚动顺延 30 天）
+            # 顺手刷新一次备份（start_uid 会随本次访问顺延）
             save_session_backup(ctx, page)
 
             try_open_task_panel(ctx)
@@ -778,7 +1232,7 @@ def cmd_run(force: bool, keep_open: bool, visible: bool, check_only: bool) -> in
 
             if check_only:
                 log_points_info(read_points_info(ctx))
-                log_session_report(session_report(ctx))
+                log_session_report(session_report(ctx), alive=alive)
                 log.info("[结果] 登录正常；发现 %d 项可领取（--check 只检测不领取）。", len(found))
                 return 0
 
@@ -790,6 +1244,9 @@ def cmd_run(force: bool, keep_open: bool, visible: bool, check_only: bool) -> in
             # 领取完再读一次积分（余额是领取后的最新值）
             points = read_points_info(ctx)
             log_points_info(points)
+
+            # 领取完报一下本地凭据的到期情况，顺便让用户知道"还能撑多久"
+            log_session_report(session_report(ctx), alive=True)
 
             state["last_success"] = today
             state["last_claim_count"] = total
@@ -815,38 +1272,38 @@ def cmd_run(force: bool, keep_open: bool, visible: bool, check_only: bool) -> in
 JS_TEXT = "() => (document.body.innerText || '').slice(0, 6000)"
 
 
-def cmd_renew(visible: bool) -> int:
-    """登录态保活：轻量访问一次首页，滚动续期凭据并报告剩余有效期。
+def cmd_renew(visible: bool, repair: bool = True) -> int:
+    """登录态检查（并默认自动补登录）：轻量访问一次，判断凭据是否仍有效。
 
-    比 run 轻得多（不点菜单、不领奖、不读积分），适合单独挂在更频繁的计划任务上，
-    例如每天跑 renew、月底跑 run，让 30 天期的凭据永远处在"刚续过"的状态。
+    比 run 轻得多（不点菜单、不领奖、不读积分）。要清楚它不能做什么：
+    访问首页只会顺延 start_uid（30 天滚动），pt_guid_sig / ams_* 等不会因此刷新，
+    服务端也可能随时把整份凭据作废（单点互斥）。
+
+    所以本命令的定位是"尽早发现问题 + 尽力自愈"：
+    - 凭据失效时，先用备份恢复，再尝试 QQ 快捷登录自动重新登录（会短暂弹窗）
+    - 都失败才返回 2 要求人工扫码
+    `--no-repair` 可关掉自动补登录，只做检查。
     """
     with sync_playwright() as pw:
-        ctx = open_context(pw, headless=not visible)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        ctx, page, ok = acquire_logged_in_context(pw, visible=visible, allow_repair=repair)
         try:
-            ok = touch_session(ctx, page)
             if not ok:
-                # 掉登录了：先用备份原地恢复，恢复不了才让人去扫码
-                log.info("[登录] 未登录，尝试用 %s 里的凭据自动恢复……", SESSION_BACKUP)
-                n = restore_session_backup(ctx, page)
-                if n and touch_session(ctx, page):
-                    log.info("[登录] 成功：已用备份的 %d 条凭据免扫码恢复。", n)
-                    ok = True
-                else:
-                    log.info("[登录] 失败：备份凭据也无法恢复，请运行 python main.py login 重新扫码。")
-                    return 2
+                log.info("[登录] 失败：本地凭据与 QQ 快捷登录都没能恢复，请运行 python main.py login 手动扫码。")
+                return 2
 
             snap = save_session_backup(ctx, page)
-            log.info("[结果] 登录态保活完成，凭据备份共 %d 条。", len(snap["cookies"]))
-            log_session_report(session_report(ctx))
+            log.info("[结果] 登录态检查完成，凭据备份共 %d 条。", len(snap["cookies"]))
+            log_session_report(session_report(ctx), alive=True)
         finally:
-            ctx.close()
+            if ctx is not None:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
     return 0
 
 
 def cmd_probe() -> int:
-    """调试：走到任务面板，把每个 frame 的可见文字导出到 logs/dom_dump.txt。"""
     out_lines = []
     with sync_playwright() as pw:
         ctx = open_context(pw)
@@ -910,8 +1367,10 @@ def main() -> int:
     p_run.add_argument("--force", action="store_true", help="忽略当天已运行记录")
     p_run.add_argument("--check", action="store_true", help="只检测有几项可领取，不点击（忽略当日去重）")
 
-    p_renew = sub.add_parser("renew", help="登录态保活：轻量访问一次，续期凭据并报告剩余有效期")
-    p_renew.add_argument("--visible", action="store_true", help="弹出浏览器窗口运行")
+    p_renew = sub.add_parser("renew", help="登录态检查：轻量访问一次，失效时自动补登录")
+    p_renew.add_argument("--visible", action="store_true", help="全程弹出浏览器窗口运行")
+    p_renew.add_argument("--no-repair", action="store_true",
+                         help="只检查不自动补登录（不弹窗，失效直接返回 2）")
 
     sub.add_parser("probe", help="调试：导出任务面板页面文字")
 
@@ -921,7 +1380,7 @@ def main() -> int:
     if args.cmd == "login":
         return cmd_login(args.wait)
     if args.cmd == "renew":
-        return cmd_renew(args.visible)
+        return cmd_renew(args.visible, repair=not args.no_repair)
     if args.cmd == "probe":
         return cmd_probe()
     return cmd_run(force=args.force, keep_open=args.keep_open,
